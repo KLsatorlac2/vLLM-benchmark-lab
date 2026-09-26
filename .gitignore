@@ -23,6 +23,22 @@ results/plots/*
 !results/processed/.gitkeep
 !results/plots/.gitkeep
 
+# --- 生成的 prompt 文件：不提交 ---
+#
+# experiments/*/prompts_*.txt 及其 .manifest.json 都由 scripts/make_prompts.py 生成，
+# 属于实验输入数据，不是源码。仓库里已经有生成它们的**完整命令**
+# （docs/runbook_three_models.md 第 3.2 节）和固定 seed=42，
+# 所以在任何机器上都能逐字节重建，不需要进版本库。
+#
+# 重建示例（本机 0.5B 全矩阵）：
+#   python scripts/make_prompts.py --mode distinct --target-tokens 512 \
+#     --num-prompts 16 --output experiments/context_length/prompts_512.txt --strict
+#
+# .manifest.json 一并排除：它记录的是被排除的 txt 的实际 token 长度，
+# 单独留在库里没有意义（会指向一个不存在的文件），而且同样是生成的。
+experiments/*/prompts_*.txt
+experiments/*/prompts_*.txt.manifest.json
+
 # --- Python ---
 __pycache__/
 *.py[cod]

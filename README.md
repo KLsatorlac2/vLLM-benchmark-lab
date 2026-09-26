@@ -144,13 +144,49 @@ Kaggle 1.5B / 7B / TP=2 尚未执行，E7（并行）因本机只有 1 张卡跳
 ```text
 vllm-benchmark-lab/
 ├── README.md
+├── project_summary.md
 ├── requirements.txt
-├── configs/
+├── .gitignore
+├── configs/                     # 三个模型的 YAML 配置
 ├── scripts/
-├── experiments/
+│   ├── common.py                # 共享 workload / 计时 / JSONL helper
+│   ├── run_hf.py                # HF generate 逐请求
+│   ├── run_vllm.py              # vLLM 离线 LLM.generate
+│   ├── benchmark_http.py        # OpenAI 兼容 server 压测（per-request TTFT/TPOT）
+│   ├── make_prompts.py          # 生成精确 token 长度的 prompt
+│   ├── summarize_results.py     # 聚合 raw JSONL
+│   ├── collect_gpu_metrics.py   # nvidia-smi 时间序列
+│   └── benchmark.py             # YAML 驱动的统一控制器
+├── experiments/                 # 每个实验只留 README（说明 + 命令 + 结果）
+│   ├── hf_vs_vllm/
+│   ├── concurrency/
+│   ├── context_length/
+│   ├── prefix_caching/
+│   ├── chunked_prefill/
+│   └── quantization/
 ├── results/
+│   ├── raw/          (.gitkeep) # 原始 JSONL —— 本地生成，不提交
+│   ├── processed/    (.gitkeep) # 聚合表   —— 本地生成，不提交
+│   └── plots/        (.gitkeep) # 图表     —— 本地生成，不提交
 └── docs/
+    ├── benchmark_report.md      # 实验报告（结论 + 数字来源）
+    ├── runbook_three_models.md  # 三模型操作手册 + 七个坑
+    └── kaggle_runbook.md        # 早期 Kaggle 笔记
 ```
+
+### 什么进版本库，什么不进
+
+| 内容 | 是否提交 | 原因 |
+| --- | --- | --- |
+| `scripts/` `docs/` `configs/` `experiments/*/README.md` | ✅ | 源码与文档 |
+| `results/*/` 目录结构（`.gitkeep`）| ✅ | 保证 clone 后目录完整 |
+| `results/raw/*.jsonl`、`results/processed/*` | ❌ | 实验数据，本地生成 |
+| `experiments/*/prompts_*.txt` + `.manifest.json` | ❌ | `make_prompts.py` 生成，seed=42 可精确重建 |
+| `.claude/settings.local.json` | ❌ | 机器级权限白名单 |
+
+**排除项都是可复现的生成物**，重建命令分别在：
+`scripts/summarize_results.py`（聚合表）、`docs/runbook_three_models.md` 第 3.2 节（prompt 文件）。
+因此本仓库 clone 下来是"能跑出同样结果"的状态，而不是"带着一堆产物"的状态。
 
 ## 常见限制
 

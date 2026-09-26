@@ -259,6 +259,12 @@ $PY scripts/make_prompts.py --mode mixed --long-tokens 3584 --short-tokens 64 --
 
 每条命令都会打印实际 token 数和一份 `*.manifest.json`（记录 workload 分布，填报告第 3 节用）。`--strict` 保证长度精确，不精确会以非零码退出。
 
+> **这些生成物不进版本库**：`experiments/*/prompts_*.txt` 和同名 `.manifest.json` 都被
+> `.gitignore` 排除。仓库里只保留**本节这些生成命令**（配合固定 `seed=42`），
+> 换一台机器照着跑就能得到逐字节相同的 prompt 文件。
+>
+> 所以 clone 仓库后**第一步必须先跑 3.2 节的生成命令**，否则所有 `--prompts` 都会指向不存在的文件。
+
 **为什么上下文实验要让总 token 数固定**：512×16、2048×4、4096×2、8192×1 四组的总 prefill 工作量都是 8192 token。这样 batch latency 的变化只来自**单条序列变长**，而不是"总工作量变多"。否则长度和总量两个变量会混在一起。
 
 ### 3.3 结果命名规范

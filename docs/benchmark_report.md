@@ -51,7 +51,12 @@
 ## 3. Workload
 
 所有 prompt 由 `scripts/make_prompts.py` 生成，**精确 token 长度**并逐条复核，
-workload 分布记在 `experiments/*/prompts_*.txt.manifest.json`。
+workload 分布记在生成的 `experiments/*/prompts_*.txt.manifest.json`。
+
+> **prompt 文件（`experiments/*/prompts_*.txt` 与同名 `.manifest.json`）不在版本库中**
+> ——它们是 `make_prompts.py` 生成的数据，`.gitignore` 已排除。
+> 重建命令与固定 seed（42）见 `docs/runbook_three_models.md` 第 3.2 节，可逐字节复现。
+> 下表就是按那些命令的参数整理的。
 
 | 实验 | prompt 文件 | 条数 | 单条 token | 总 prefill token | 输出上限 |
 | --- | --- | --- | --- | --- | --- |

@@ -131,6 +131,10 @@ vllm-benchmark-lab/
 `random-prefix` / `mixed`。带 `--check` 复核、`--strict` 保证长度精确，
 并输出 `*.manifest.json` 记录 workload 分布（填报告第 3 节用）。
 
+**生成的 `prompts_*.txt` 与 `.manifest.json` 都不进版本库**（`.gitignore` 已排除）：
+它们是实验输入数据，用固定 seed=42 和 `docs/runbook_three_models.md` 第 3.2 节的命令
+可逐字节重建，所以仓库里只留生成命令，不留产物。
+
 ### `scripts/benchmark_http.py`
 
 **新增**。走 OpenAI 兼容 server 压测，输出 **per-request** 的 `ttft_ms` / `tpot_ms` /
