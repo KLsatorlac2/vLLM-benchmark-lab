@@ -1,0 +1,24 @@
+{
+  "mode": "distinct",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "seed": 42,
+  "num_prompts": 4,
+  "target_tokens": 2048,
+  "prefix_tokens": null,
+  "actual_tokens": [
+    2048,
+    2048,
+    2048,
+    2048
+  ],
+  "actual_min": 2048,
+  "actual_mean": 2048,
+  "actual_max": 2048,
+  "labels": [
+    "",
+    "",
+    "",
+    ""
+  ],
+  "output": "experiments/context_length/prompts_2048.txt"
+}

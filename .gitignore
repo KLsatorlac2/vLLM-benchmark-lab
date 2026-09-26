@@ -1,0 +1,40 @@
+# --- 实验产物：只保留目录结构，不提交数据 ---
+#
+# results/ 下三个子目录用 .gitkeep 占位，保证 clone 后目录结构完整；
+# 里面的实验文件一律不提交：
+#   results/raw/       *.jsonl  原始逐请求结果（含 GPU 遥测）
+#   results/processed/ *.csv    聚合表
+#   results/plots/     图表
+#
+# 注意：`results/processed/*` 是整目录排除，*.md 摘要同样不提交。
+# 这些文件都是 scripts/summarize_results.py 生成的，本地一条命令即可重建：
+#
+#   python scripts/summarize_results.py results/raw/local-0.5b-*.jsonl \
+#     --gpu results/raw/gpu-local-0.5b-http-16.jsonl \
+#     --output-md results/processed/summary-local-0.5b.md \
+#     --output-csv results/processed/summary-local-0.5b.csv
+#
+# 排除规则用 `dir/*` 而不是按扩展名，这样将来新增的结果格式（新后缀、
+# 新实验子目录）默认也是不提交的——宁可漏提交，不可误提交。
+results/raw/*
+results/processed/*
+results/plots/*
+!results/raw/.gitkeep
+!results/processed/.gitkeep
+!results/plots/.gitkeep
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.cache/
+
+# --- 模型权重 ---
+models/
+
+# --- 本地工具配置 ---
+# settings.local.json 是 Claude Code 的机器级权限白名单，因人/因机而异，
+# 不应进版本库（共享配置应放在 settings.json）。
+.claude/settings.local.json
+.ipynb_checkpoints/
