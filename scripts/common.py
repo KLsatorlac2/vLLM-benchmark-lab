@@ -74,12 +74,34 @@ def ns_to_ms(value: int) -> float:
     return value / 1_000_000
 
 
+# Environment variables that change what the numbers mean. `VLLM_USE_V1` picks the
+# engine (V0 vs V1 differ by ~10% on identical configs, see docs/runbook_three_models.md
+# pitfall 7), the attention backend decides how long context performs, and
+# `CUDA_VISIBLE_DEVICES` decides which GPUs a tensor-parallel run actually used.
+# Recording them is the difference between a result that can be attributed and one
+# that cannot; an unset variable is recorded explicitly rather than omitted.
+TRACKED_ENV_VARS = (
+    "VLLM_USE_V1",
+    "VLLM_WORKER_MULTIPROC_METHOD",
+    "VLLM_ATTENTION_BACKEND",
+    "CUDA_VISIBLE_DEVICES",
+    "HF_HOME",
+)
+
+
 def environment_metadata() -> dict[str, Any]:
     metadata: dict[str, Any] = {
         "hostname": os.uname().nodename,
         "pid": os.getpid(),
         "python": os.sys.version.split()[0],
+        "env_vars": {name: os.environ.get(name, "<unset>") for name in TRACKED_ENV_VARS},
     }
+    try:
+        import transformers
+
+        metadata["transformers"] = transformers.__version__
+    except Exception as exc:  # pragma: no cover - optional dependency
+        metadata["transformers_error"] = str(exc)
     try:
         import torch
 

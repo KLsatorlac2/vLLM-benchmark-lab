@@ -47,3 +47,67 @@
 | 与 FP16 对齐的基线（同引擎、同显存配额）| **未跑**，这是最该补的一条 |
 
 分析见 `docs/benchmark_report.md` 第 10 节。
+
+## Kaggle T4 ×2 / Qwen2.5-1.5B（2026-09-27）✅ **本项目第一个可归因的量化结论**
+
+同一份默认 prompt（10–12 token）、16 请求、`max_tokens=64`、`max_model_len=1024`、
+`dtype=half`、**引擎 V0**、`gpu_memory_utilization=0.85`。
+
+| 臂 | checkpoint | batch 延迟 | batch 吞吐 | 相对 FP16 基线 |
+| --- | --- | --- | --- | --- |
+| FP16 基线 | `Qwen/Qwen2.5-1.5B-Instruct` | 1212.59 ms | 844.47 tok/s | — |
+| **AWQ** | `Qwen/Qwen2.5-1.5B-Instruct-AWQ` | **1070.26 ms** | **956.78 tok/s** | **延迟 ×0.883，吞吐 +13.3%** |
+
+### 为什么这一节比本机可信：变量逐项对齐
+
+| 维度 | FP16 基线 | AWQ | 对齐？ |
+| --- | --- | --- | --- |
+| 引擎 | **V0** | **V0** | ✅（Kaggle 全部 V0）|
+| `dtype` | half | half | ✅ |
+| `gpu_memory_utilization` | 0.85 | 0.85 | ✅ |
+| prompt | 默认（10–12 token）| 同左 | ✅ |
+| `requests` / `max_num_seqs` | 16 / 16 | 16 / 16 | ✅ |
+| `max_model_len` / `max_tokens` | 1024 / 64 | 1024 / 64 | ✅ |
+| `seed` / `tensor_parallel_size` | 42 / 1 | 42 / 1 | ✅ |
+| **唯一变量** | FP16 权重 | **4-bit AWQ 权重** | — |
+
+实测 `input_tokens` 两臂都是 `11(12)`，**逐条一致**。
+
+> **对比本机第 10 节**：那里三个臂的引擎、显存配额、prompt **全不一致**，
+> 13% 的差**归因不了**。Kaggle 这一节把那个坑填上了——
+> **讽刺的是，帮上忙的正是那个"限制"：T4 不支持 V1，反而让所有臂被迫同引擎。**
+
+### 结论与边界
+
+1. **AWQ 在 T4 + 1.5B 上带来 +13.3% 吞吐、延迟降到 0.883 倍。**
+2. **这是收益的下界，不是上界。** T4 是 SM 7.5，**没有 Marlin kernel**（需 SM 8.0+），
+   AWQ 只能走较慢的解量化路径。支持 Marlin 的硬件上收益应当更大。
+3. **机制上没有惊喜**：batch=16、prompt 只有 10 token，decode 阶段是**显存带宽受限**的，
+   权重从 16 bit 压到 4 bit 直接减少了每步要读的字节数。
+4. ⚠️ **本节的收益是"速度"，不是"显存"。**
+
+### 显存：仍然无数据
+
+**Kaggle 侧一个 GPU 遥测文件都没有**，也没有 KV cache usage 指标。
+按项目规则（不用总显存占用替代 KV cache usage），**本节不提供任何实测显存数字**。
+
+只做**算术推算**，且必须标明它不是测量值：
+
+```text
+FP16 权重：1.5B × 2 B            ≈ 3.1 GB
+AWQ  权重：1.5B × 0.5 B + 开销   ≈ 0.8 – 1.3 GB
+推算节省                          ≈ 1.8 – 2.3 GB
+```
+
+**要回答"量化省了多少显存"，必须补一次带 `collect_gpu_metrics.py` 的对照 run。**
+
+### 未执行 / 无数据
+
+| 项 | 状态 |
+| --- | --- |
+| GPTQ on T4 | **未执行** |
+| fp8 KV cache | **T4 不支持**（需 SM 8.9+），本机才有这一臂 |
+| 量化臂的显存对比 | **无数据**（未采 GPU 遥测）|
+| AWQ 输出 sanity check | **未做**——`--include-text` 已传，产物里有 `text` 字段，但本次未逐条比对 |
+
+分析见 `docs/benchmark_report.md` Part II 第 20 节。

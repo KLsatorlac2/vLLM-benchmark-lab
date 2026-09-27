@@ -42,13 +42,44 @@ torch.compile takes 51.11 s in total       # 首次启动编译耗时
 > 第 6、7 条都说明同一件事：**V1 相对 V0 缺少若干特性**。本机默认 V1，所以
 > 凡是要用到这些特性的臂，都得显式退回 V0，并在报告里标注引擎版本。
 
+### 0.1 Kaggle T4 实测确认的事实（2026-09-27，1.5B 全矩阵）
+
+Kaggle 环境与上面的本机**不是一回事**，开工前必须按这一节的实际情况准备，
+第 5 节的命令已按这些事实更新过：
+
+8. **T4 不支持 vLLM V1**（SM 7.5）。所以 Kaggle 侧**除 HF 外全部 run 都跑在 V0 上**
+   （20 个 vLLM run，`VLLM_USE_V1=0`）。见坑 8。
+9. **T4 不支持 BF16**。所有 vLLM 命令**必须加 `--dtype half`**（实测 20/20 个 run 都是 `half`）。
+   见坑 9。
+10. **T4 上 FlashAttention-2 不可用**，vLLM 报 FA2 不适用于该 GPU，自动改用 **XFormers** backend。
+    见坑 10。
+11. **Transformers 5.0.0 与 vLLM 0.8.5.post1 不兼容**，必须降到 **4.51.1**。见坑 11。
+12. **Kaggle 预装的 TensorFlow 与 vLLM 的 protobuf 要求冲突**，需要卸载 TensorFlow
+    （实验本身不用 TF）。见坑 12。
+13. **Kaggle Notebook 不允许后台进程**——`nohup ... &` 起的 server 随 cell 结束被回收，
+    HTTP 压测会全数 `APIConnectionError`。见坑 13。
+
+> **第 8 条和第 10 条很可能同源**：T4 是 SM 7.5，而 V1 依赖 FlashAttention 系 kernel（需 SM 8.0+）。
+> **这是推断**——本次没有保存 vLLM 启动日志，无法从产物确认。
+
+> **第 8 条同时带来一个好处**：Kaggle 全在 V0 上，所以 Kaggle 内部的对照**都是同引擎对照**。
+> 报告 Part II 第 20 节的 AWQ vs FP16 因此**第一个做到了可归因**（+13.3%），
+> 而本机同实验的三个混淆变量（坑 7）在 Kaggle 上不存在。
+
+> **记录缺陷（比坑 7 那条更严重）**：`environment_metadata()` 原先不记 `VLLM_USE_V1`，
+> 所以"Kaggle 全在 V0"这一事实**只来自操作者陈述，产物无法自证**。
+> 已于 2026-09-27 修补（新增 `env_vars` 字段），但**对已跑完的 Kaggle 结果无效**。
+
 ---
 
-## 1. 七个坑：五个会静默污染结果，两个会直接报错
+## 1. 坑 1–7：本机（RTX 4060）撞到的
 
 坑 1–5 的共同点是**命令能跑完、结果却不可信**，必须靠人去看日志和数字才能发现。
 坑 6–7 是 2026-09-26 本机跑 0.5B 全矩阵时实际撞到的两个报错，**会在启动阶段直接崩**，反而容易发现；
 之所以还是记下来，是因为它们各自改动了实验的配置口径，报告里必须交代（见坑 6、坑 7 末尾的"对结果的影响"）。
+
+> **Kaggle 专用的坑 8–13 在第 1.1 节**，坑 6 的一个边界条件补充在第 1.2 节。
+> 开工前按环境对号入座：本机读坑 1–7，Kaggle 读坑 8–13。
 
 ### 坑 1：V1 下 chunked prefill 关不掉
 
@@ -189,23 +220,162 @@ VLLM_USE_V1=0 $PY scripts/run_vllm.py \
 
 ### 额外两条硬件限制（Kaggle T4）
 
-- **T4 不支持 bfloat16**（Turing 无 BF16）。T4 上 `dtype=auto` 会解析成 float16，**不要手动指定 bfloat16**。
+- **T4 不支持 bfloat16**（Turing 无 BF16）。T4 上 `dtype=auto` 会解析成 float16，**不要手动指定 bfloat16**。见坑 9。
 - **T4 不支持 fp8 KV cache**（需要 SM 8.9+）。`--kv-cache-dtype fp8` 只在本机 4060（Ada）上做。
-- T4 上 AWQ/GPTQ 没有 Marlin kernel（需要 SM 80+），走较慢的解量化路径。所以 **T4 上量化的收益主要是显存，不是速度**，这本身就是一条值得写的结论。
+- T4 上 AWQ/GPTQ 没有 Marlin kernel（需要 SM 80+），走较慢的解量化路径。
+
+> ⚠️ **上面第三条原本跟着一句预测："所以 T4 上量化的收益主要是显存，不是速度"。**
+> **2026-09-27 实测推翻了这句话的速度部分**：AWQ 在 T4 上相对 FP16 基线
+> **快了 13.3%**（报告 Part II 第 20 节）。原因不神秘——batch=16 的短 prompt decode
+> 是**显存带宽受限**的，权重从 16 bit 压到 4 bit 直接减少每步要读的字节数。
+> 没有 Marlin 只意味着**这个 13.3% 是收益的下界**，不是"没有速度收益"。
+> **显存那一半仍然无数据**（Kaggle 侧零遥测），所以那句话只有后半段还成立。
 
 ---
 
-## 2. 实验矩阵
+## 1.1 Kaggle 专用坑（坑 8–13）
+
+坑 8–13 是 2026-09-27 在 Kaggle T4 上跑 1.5B 全矩阵时实际撞到的，与本机无关。
+**它们的共同点是：全部会改变实验的配置口径，所以报告里必须逐条交代。**
+
+### 坑 8：T4 不支持 vLLM V1，全部退回 V0
+
+T4 是 SM 7.5，V1 在本机（SM 8.9）能用、在 T4 上不能用。处理方式是给每个 vLLM 命令加：
+
+```bash
+VLLM_USE_V1=0
+```
+
+**对结果的影响（四条，详见报告第 13.3 节）：**
+
+1. **Kaggle 内部对照更干净**：E6 的 AWQ vs FP16、E7 的 TP=1 vs TP=2 都是同引擎对照。
+   本机 E6 那个"13% 归因不了"的坑，在 Kaggle 上不存在。
+2. **与 Part I 增加一层混淆**：本机默认 V1，V0/V1 本身差约 10%（坑 7 的表）。
+   跨硬件比较因此有四个同时变化的变量（GPU、模型、dtype、引擎）。
+3. **E5 的 `v1ref` 参考臂在 Kaggle 上做不了**，本机"V1 切块比 V0 快 11.2%"无法交叉验证。
+4. **坑 1、坑 2 在 Kaggle 上不适用**：那两条是 V1 行为。V0 下 chunked prefill 能真的关掉、
+   prefix caching 默认就是关的，所以 `--enable-prefix-caching` 的开关语义比本机更直接。
+
+### 坑 9：T4 不支持 BF16，必须显式 `--dtype half`
+
+Turing 没有 BF16。**Kaggle 的每条 vLLM 命令都要加：**
+
+```bash
+--dtype half
+```
+
+> **本次教训**：本手册第 5.2 节原先的 Kaggle 命令**都没有写 `--dtype half`**，
+> 是按 `dtype=auto` 写的；实际执行时加了，**产物里 20/20 个 run 都是 `dtype: half`**。
+> 手册已按产物更正。**这是"手册与产物不一致"的典型**——记录以产物为准。
+
+**对结果的影响**：本机 0.5B 是 bfloat16，Kaggle 是 float16，跨硬件比较的第二个混淆变量（同坑 8 第 2 条）。
+
+### 坑 10：T4 上 FlashAttention-2 不可用，vLLM 改用 XFormers
+
+Kaggle 日志显示 FA2 不适用于该 GPU，vLLM 自动选择 XFormers backend。
+
+**对结果的影响**：长上下文性能。报告 Part II 第 17.3 节里
+"16384 的代价"在本机是 ×1.50（FlashAttention）、在 T4 是 ×2.10（XFormers），
+**attention backend 是最贴合这个现象的候选解释**——但没有记录 backend（见下），也无法与
+"模型大 3 倍"分离。
+
+> **记录缺陷**：attention backend **不在 JSONL 里**。本次修补 `environment_metadata()`
+> 时加了 `VLLM_ATTENTION_BACKEND` 环境变量，但**vLLM 自动选择的 backend 不会写进这个变量**
+> ——要真正记下来，得让 `run_vllm.py` 从 `llm.llm_engine.vllm_config` 里读。**这条仍未做。**
+
+### 坑 11：Transformers 5.0.0 与 vLLM 0.8.5.post1 不兼容
+
+Kaggle 预装的 transformers 是 5.0.0，与 vLLM 0.8.5.post1 冲突。**降到 4.51.1：**
+
+```bash
+!pip install -q "transformers==4.51.1"
+```
+
+**对结果的影响：无（不影响推理数字），但有记录缺陷：**
+
+- `results/raw/env-kaggle-1.5b.json` 记的是 `transformers: 5.0.0`，
+  与实际使用的 **4.51.1 矛盾**，**该快照不可信**；
+- 每次 run 的 metadata **根本不记 transformers**，所以哪个 run 用哪个版本**不可考**。
+
+> **修法**：`environment_metadata()` 已补 `transformers` 字段（2026-09-27），
+> 但**已有产物无效**，且 `env-kaggle-1.5b.json` 需要**重拍**。
+
+### 坑 12：Kaggle 预装的 TensorFlow 与 vLLM 的 protobuf 要求冲突
+
+现象是 protobuf 版本冲突导致 vLLM 导入失败。**实验不需要 TensorFlow**，直接卸载：
+
+```bash
+!pip uninstall -y tensorflow tensorflow-io-gcs-filesystem
+```
+
+**对结果的影响：无**（TF 不参与推理）。但**这一步不写进任何产物**，
+所以**下一个 session 会原样重现**，必须靠本手册提醒。
+
+### 坑 13：Kaggle Notebook 不允许后台进程 → HTTP server 实验会全数失败
+
+runbook 第 5.3 节原本用 `nohup ... &` 起 server，**在 Kaggle 上不成立**：
+后台进程随 cell 结束被回收，压测时端口无人监听，
+64 个请求会全部以 `APIConnectionError: Connection error.` 失败。
+
+**实测产物**（保留为失败实验，不删）：
+
+```text
+results/raw/kaggle-1.5b-http-concurrency-16.jsonl
+status=failed   ok=0   failed=64   output_tokens=0
+errors: APIConnectionError: Connection error.  ×64
+```
+
+**对结果的影响（很大）**：
+
+- Kaggle 侧**零 per-request 指标**（TTFT / TPOT / p95 / p99 / req/s）；
+- 报告 E4（prefix caching）与 E5（chunked prefill）的**尾延迟问题在 T4 上同样没答**；
+- 做不了 Part I 第 5.3 节那种 **server 与离线的交叉验证**。
+
+**绕过方案（本次未验证，见报告第 22.3 节）**：把 server 的整个生命周期**关在一个 cell 内**
+——`subprocess.Popen` 启动 → 轮询 `/v1/models` 直到就绪 → 跑 `benchmark_http.py` → `terminate()`。
+**关键是不要跨 cell。**
+
+---
+
+## 1.2 坑 6 的补充：只在显式传参时才触发
+
+坑 6 说"V0 下 `max_num_batched_tokens` 必须 ≥ `max_model_len`"。
+2026-09-27 的 Kaggle E3 给出了一个重要的边界条件：
+
+**E3 的 16384 臂用了 `max_model_len=16896` 且没有传 `--max-num-batched-tokens`，正常跑完。**
+E3 的 4096 臂用 `max_model_len=4608`，同样没传预算，也正常跑完。
+
+**所以坑 6 只在"显式传了一个偏小的 `--max-num-batched-tokens`"时才会崩。**
+不传时 V0 会把单步预算自己设得足够大。
+
+> 这条不改变坑 6 的结论（E5 的 OFF 臂确实是显式传 4096 撞上 4608 崩的），
+> 但它把触发条件说清楚了：**崩的是"参数组合"，不是"V0 用不了长上下文"。**
+
+---
+
+## 2. 实验矩阵与执行状态
+
+**图例**：✅ 已完成 ｜ ⚠️ 跑完但有未解决的问题 ｜ ❌ 执行失败/跳过 ｜ ⬜ 未执行
+
+截至 **2026-09-27**：三模型矩阵完成 **2/3**（0.5B 本机 + 1.5B Kaggle）。
 
 | 编号 | 实验 | 0.5B 本机 | 1.5B Kaggle | 7B Kaggle |
 | --- | --- | --- | --- | --- |
 | E1 | HF vs vLLM 基线 | ✅ | ✅ | ❌ 单卡放不下 FP16 |
-| E2 | 并发扫描 | ✅ 16/32/64 | ✅ 16/64/128/256 | ✅ 16/64 |
-| E3 | 上下文长度 | ✅ 512→16384 | ✅ 512→16384 | ✅ 512→8192 |
-| E4 | Prefix caching | ✅ | ✅ | ✅ |
-| E5 | Chunked prefill（V0）| ✅ | ✅ | ✅ |
-| E6 | 量化 | ✅ AWQ + fp8 KV | ✅ AWQ | ✅ AWQ vs GPTQ |
-| E7 | 并行 | ❌ 单卡 | ✅ TP=1 vs TP=2 | ✅ TP=1 vs TP=2 |
+| E2 | 并发扫描 | ✅ 16/32/64（128/256 未扫）| ✅ 16/64/128/256 | ⬜ |
+| E3 | 上下文长度 | ✅ 512→16384 | ✅ 512→16384 | ⬜ |
+| E4 | Prefix caching | ✅ 四臂 | ⚠️ 四臂跑完，**异常未解释**（报告 18 节）| ⬜ |
+| E5 | Chunked prefill（V0）| ✅ `off`/`on` + `v1ref` | ✅ `off`/`on`，**无 `v1ref`**（T4 无 V1）| ⬜ |
+| E6 | 量化 | ✅ AWQ + fp8 KV（**归因不了**）| ✅ AWQ（**可归因 +13.3%**）| ⬜ AWQ vs GPTQ |
+| E7 | 并行 | ❌ 单卡跳过 | ✅ TP=1 vs TP=2（**+24.8%**）| ⬜ |
+| E7b | 两个独立单卡实例 | ❌ 单卡 | ⬜ **未执行** | ⬜ |
+| E8 | HTTP server | ✅ 1 组（per-request）| ❌ **失败**（坑 13）| ⬜ |
+
+**Kaggle 1.5B 的产物规模**：22 个文件 = 20 个 vLLM run + 1 个 HF run + 1 个失败的 server run。
+
+> **E4 的 ⚠️ 要特别注意**：Kaggle 的 prefix caching 结果与本机**方向相反**
+> （本机 +21.9%，T4 −59.9%），相邻 run 的 pid 已排除机器漂移，但原因未定。
+> **在查清之前，E4 在 Kaggle 侧等于没有结论**，详见报告 Part II 第 18 节。
 
 ---
 
@@ -525,12 +695,14 @@ import os
 os.environ["HF_HOME"] = "/kaggle/temp/hf-cache"
 os.environ["TRANSFORMERS_CACHE"] = "/kaggle/temp/hf-cache"
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_USE_V1"] = "1"          # chunked prefill 的 A/B 再单独改成 "0"
+os.environ["VLLM_USE_V1"] = "0"          # T4 不支持 V1，见坑 8；本机才是 "1"
 ```
 
 > Notebook 里设置环境变量必须早于 `import transformers/vllm`，否则不生效。
 >
 > 模型缓存放 `/kaggle/temp` 而不是 `/kaggle/working`：`/kaggle/working` 有约 20GB 输出配额，权重放进去会挤掉结果文件的保存空间。
+>
+> ⚠️ **`VLLM_USE_V1` 必须显式设成 `"0"`**。不设的话会走默认值，在 T4 上直接起不来（坑 8）。
 
 **Cell 2：确认 GPU 与版本**
 
@@ -539,13 +711,25 @@ os.environ["VLLM_USE_V1"] = "1"          # chunked prefill 的 A/B 再单独改�
 !python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'gpus', torch.cuda.device_count())"
 ```
 
-**Cell 3：安装 vLLM**
+**Cell 3：装依赖——三条命令都是 2026-09-27 实测需要的**
 
 ```python
+# 1) Kaggle 预装的 TensorFlow 与 vLLM 的 protobuf 要求冲突，实验不需要 TF，直接卸掉（坑 12）
+!pip uninstall -y -q tensorflow tensorflow-io-gcs-filesystem
+
+# 2) Kaggle 预装 transformers 5.0.0，与 vLLM 0.8.5.post1 不兼容，必须降到 4.51.1（坑 11）
+!pip install -q "transformers==4.51.1"
+
+# 3) 装 vLLM
 !pip install -q vllm==0.8.5.post1
 ```
 
 Kaggle 预装的 torch 版本和 vLLM 0.8.5.post1 可能不匹配，pip 可能连带升级/降级 torch。**这是可以接受的，但必须记录**——项目的规则本来就要求跨硬件结果分别标注。
+
+**实测结果**：torch 保持 **2.6.0+cu124**、vLLM **0.8.5.post1**、CUDA **12.4**（22 个 run 的 metadata 一致）。
+
+> ⚠️ **Cell 4 拍的环境快照不可信**：它记的是 `transformers: 5.0.0`，而实际使用的是降级后的
+> **4.51.1**。快照首行日志时间是 `09-27 07:18:41`。**这个文件需要重拍**，见坑 11。
 
 **Cell 4：记录本次环境到结果目录**
 
@@ -578,17 +762,24 @@ Qwen2.5 各尺寸共用同一套 tokenizer，所以本机生成的 prompt 文件
 
 ### 5.2 实验命令（Kaggle cell 里用 `!` 前缀）
 
+> **本节命令已按 2026-09-27 的实测产物更正。** 更正内容有两处，都是原手册缺的：
+> 每条 vLLM 命令都要加 **`VLLM_USE_V1=0`**（坑 8）和 **`--dtype half`**（坑 9）。
+> 原手册的 Kaggle 命令这两样都没写，是按本机的 `dtype=auto` + V1 写的。
+
 **E1 HF vs vLLM**
 
 ```bash
+# HF 臂不受坑 8/9 影响：run_hf.py 走 transformers，dtype=auto
 !python scripts/run_hf.py --model Qwen/Qwen2.5-1.5B-Instruct \
   --requests 1 --max-tokens 64 --output results/raw/kaggle-1.5b-hf-single.jsonl
 
-!python scripts/run_vllm.py --model Qwen/Qwen2.5-1.5B-Instruct \
+!CUDA_VISIBLE_DEVICES=0 VLLM_USE_V1=0 python scripts/run_vllm.py \
+  --model Qwen/Qwen2.5-1.5B-Instruct --dtype half \
   --requests 1 --max-num-seqs 1 --max-model-len 1024 --max-tokens 64 \
   --gpu-memory-utilization 0.85 --output results/raw/kaggle-1.5b-vllm-single.jsonl
 
-!python scripts/run_vllm.py --model Qwen/Qwen2.5-1.5B-Instruct \
+!CUDA_VISIBLE_DEVICES=0 VLLM_USE_V1=0 python scripts/run_vllm.py \
+  --model Qwen/Qwen2.5-1.5B-Instruct --dtype half \
   --requests 16 --max-num-seqs 16 --max-model-len 1024 --max-tokens 64 \
   --gpu-memory-utilization 0.85 --output results/raw/kaggle-1.5b-vllm-batch16.jsonl
 ```
@@ -597,8 +788,8 @@ Qwen2.5 各尺寸共用同一套 tokenizer，所以本机生成的 prompt 文件
 
 ```bash
 !for SEQ in 16 64 128 256; do \
-  CUDA_VISIBLE_DEVICES=0 python scripts/run_vllm.py \
-    --model Qwen/Qwen2.5-1.5B-Instruct \
+  CUDA_VISIBLE_DEVICES=0 VLLM_USE_V1=0 python scripts/run_vllm.py \
+    --model Qwen/Qwen2.5-1.5B-Instruct --dtype half \
     --prompts experiments/concurrency/prompts_512x64.txt \
     --requests 64 --max-num-seqs $SEQ \
     --max-model-len 1024 --max-tokens 64 \
@@ -609,13 +800,17 @@ done
 
 T4 16GB 跑 1.5B：权重约 3.1GB，KV cache 约 28 KB/token。`gpu_memory_utilization=0.85` 时 KV 池约 10GB ≈ 36 万 token，`max_num_seqs=256` 配 1024 上下文约需 26 万 token，放得下。
 
+**实测结论**：四档全部跑完、**没有 OOM**，但**吞吐在 64 就封顶了**
+（64→128 −1.4%、128→256 −2.0%）。天花板是**并发请求数本身**，不是显存。
+加宽 `max_num_seqs` 之前先问"并发请求有多少"——见报告 Part II 第 16 节。
+
 **E3 上下文长度**
 
 ```bash
 !for CFG in "512 16 1024" "2048 4 2560" "4096 2 4608" "8192 1 8704" "16384 1 16896"; do \
   set -- $CFG; \
-  CUDA_VISIBLE_DEVICES=0 python scripts/run_vllm.py \
-    --model Qwen/Qwen2.5-1.5B-Instruct \
+  CUDA_VISIBLE_DEVICES=0 VLLM_USE_V1=0 python scripts/run_vllm.py \
+    --model Qwen/Qwen2.5-1.5B-Instruct --dtype half \
     --prompts experiments/context_length/prompts_$1.txt \
     --requests $2 --max-num-seqs $2 --max-model-len $3 --max-tokens 64 \
     --gpu-memory-utilization 0.85 \
@@ -623,13 +818,17 @@ T4 16GB 跑 1.5B：权重约 3.1GB，KV cache 约 28 KB/token。`gpu_memory_util
 done
 ```
 
+> **注意这里没有传 `--max-num-batched-tokens`**，所以**不会触发坑 6**
+> ——即使 `max_model_len=16896` 也一样跑得完。坑 6 只在**显式传了一个偏小的预算**时才崩，
+> 见第 1.2 节。
+
 **E4 Prefix caching**
 
 ```bash
 !for ARM in shared random; do for CACHE in off on; do \
   FLAG=""; [ "$CACHE" = "on" ] && FLAG="--enable-prefix-caching"; \
-  CUDA_VISIBLE_DEVICES=0 python scripts/run_vllm.py \
-    --model Qwen/Qwen2.5-1.5B-Instruct \
+  CUDA_VISIBLE_DEVICES=0 VLLM_USE_V1=0 python scripts/run_vllm.py \
+    --model Qwen/Qwen2.5-1.5B-Instruct --dtype half \
     --prompts experiments/prefix_caching/prompts_${ARM}_1024.txt \
     --requests 16 --max-num-seqs 16 --max-model-len 1280 --max-tokens 64 \
     --gpu-memory-utilization 0.85 $FLAG \
@@ -637,18 +836,25 @@ done
 done; done
 ```
 
-**E5 Chunked prefill（V0）**
+> 坑 2（V1 下 prefix caching 默认开）**在 Kaggle 上不适用**：V0 下默认就是关的，
+> 所以这里的 `off` 臂不传参即为真 off，比本机干净。
+>
+> ⚠️ **实测出了一个未解释的异常**：`shared-on` 比 `shared-off` **慢 2.49 倍**，
+> 而本机同实验是**快 21.9%**——方向相反。相邻 run 的 pid 已排除机器漂移。
+> **查清之前不要把这一臂写成结论**，见报告 Part II 第 18 节。
+
+**E5 Chunked prefill（V0，本机与 Kaggle 都是 V0）**
 
 ```bash
 !CUDA_VISIBLE_DEVICES=0 VLLM_USE_V1=0 python scripts/run_vllm.py \
-  --model Qwen/Qwen2.5-1.5B-Instruct \
+  --model Qwen/Qwen2.5-1.5B-Instruct --dtype half \
   --prompts experiments/chunked_prefill/prompts_mixed.txt \
   --requests 16 --max-num-seqs 16 --max-model-len 4096 --max-tokens 64 \
   --max-num-batched-tokens 4096 --gpu-memory-utilization 0.85 \
   --output results/raw/kaggle-1.5b-chunked-off.jsonl
 
 !CUDA_VISIBLE_DEVICES=0 VLLM_USE_V1=0 python scripts/run_vllm.py \
-  --model Qwen/Qwen2.5-1.5B-Instruct \
+  --model Qwen/Qwen2.5-1.5B-Instruct --dtype half \
   --prompts experiments/chunked_prefill/prompts_mixed.txt \
   --requests 16 --max-num-seqs 16 --max-model-len 4096 --max-tokens 64 \
   --max-num-batched-tokens 2048 --enable-chunked-prefill \
@@ -657,32 +863,42 @@ done; done
 ```
 
 > `--max-model-len` 用 **4096**（不是 4608）：与本机一致，避开坑 6。
-> T4 不支持 fp8 KV cache，所以 Kaggle 上没有坑 7 对应的那一臂。
+> **T4 上没有 `v1ref` 臂**（V1 不可用，坑 8），所以本机那条
+> "V1 的切块比 V0 快 11.2%"**在 Kaggle 上无法交叉验证**。
+> T4 也不支持 fp8 KV cache，所以 Kaggle 上没有坑 7 对应的那一臂。
 
 **E6 量化**
 
 ```bash
-!CUDA_VISIBLE_DEVICES=0 python scripts/run_vllm.py \
-  --model Qwen/Qwen2.5-1.5B-Instruct-AWQ --quantization awq \
+!CUDA_VISIBLE_DEVICES=0 VLLM_USE_V1=0 python scripts/run_vllm.py \
+  --model Qwen/Qwen2.5-1.5B-Instruct-AWQ --quantization awq --dtype half \
   --requests 16 --max-num-seqs 16 --max-model-len 1024 --max-tokens 64 \
   --gpu-memory-utilization 0.85 \
   --output results/raw/kaggle-1.5b-awq.jsonl --include-text
 ```
 
+> **FP16 基线用 E1 的 `kaggle-1.5b-vllm-batch16`**：同引擎（V0）、同
+> `gpu_memory_utilization=0.85`、同 prompt（默认 10–12 token）、同 `max_num_seqs=16`，
+> **唯一变量是权重位宽**。这与本机的情况完全不同——本机那条基线三个变量都没对齐
+> （坑 7），所以**本机的量化结论归因不了，Kaggle 的可以**。
+>
+> 实测：**AWQ 快 13.3%**（延迟 ×0.883）。注意 T4 没有 Marlin kernel（需 SM 8.0+），
+> 所以这个数是**下界**。
+
 **E7 TP=1 vs TP=2**
 
 ```bash
-# 单卡基线（前面已有 concurrency-16，这里用同一份 prompt 保持可比）
-!CUDA_VISIBLE_DEVICES=0 python scripts/run_vllm.py \
-  --model Qwen/Qwen2.5-1.5B-Instruct \
+# 单卡基线（与 E2 的 concurrency-64 配置完全相同，构成一次重复实验）
+!CUDA_VISIBLE_DEVICES=0 VLLM_USE_V1=0 python scripts/run_vllm.py \
+  --model Qwen/Qwen2.5-1.5B-Instruct --dtype half \
   --prompts experiments/concurrency/prompts_512x64.txt \
   --requests 64 --max-num-seqs 64 --max-model-len 1024 --max-tokens 64 \
-  --gpu-memory-utilization 0.85 \
+  --gpu-memory-utilization 0.85 --tensor-parallel-size 1 \
   --output results/raw/kaggle-1.5b-tp1.jsonl
 
 # 双卡 Tensor Parallel
-!CUDA_VISIBLE_DEVICES=0,1 python scripts/run_vllm.py \
-  --model Qwen/Qwen2.5-1.5B-Instruct \
+!CUDA_VISIBLE_DEVICES=0,1 VLLM_USE_V1=0 python scripts/run_vllm.py \
+  --model Qwen/Qwen2.5-1.5B-Instruct --dtype half \
   --tensor-parallel-size 2 \
   --prompts experiments/concurrency/prompts_512x64.txt \
   --requests 64 --max-num-seqs 64 --max-model-len 1024 --max-tokens 64 \
@@ -690,15 +906,35 @@ done; done
   --output results/raw/kaggle-1.5b-tp2.jsonl
 ```
 
-T4 之间走 PCIe、没有 NVLink，TP=2 的通信开销可能吃掉收益。**这正是要测的东西**：小模型 + 慢互联，TP=2 很可能比 TP=1 更慢。报告里必须和"两个独立单卡实例"区分开，不能混称。
+> **`tp1` 与 E2 的 `concurrency-64` 配置完全相同**，是同一次 session 里跑了两次。
+> 两者相差 **1.19%**，这就是本项目的**运行间噪声底（±1.2%）**，非常有用——
+> 报告 Part II 第 13.5 节用它来判断哪些差异可以解释。**不要把这条重复当成浪费。**
+
+**⚠️ 原手册在这里写下的预测是错的，保留作为记录：**
+
+> ~~"T4 之间走 PCIe、没有 NVLink，TP=2 的通信开销可能吃掉收益。
+> 这正是要测的东西：小模型 + 慢互联，TP=2 很可能比 TP=1 更慢。"~~
+
+**实测：TP=2 快 24.8%，预测反了。** 原因见报告 Part II 第 21.1 节：
+1.5B 太小，decode 阶段瓶颈是**显存带宽而非算力**，TP=2 把权重切两半、
+每卡每步只读一半权重，带宽瓶颈直接减半；而 all-reduce 的总量很小。
+**"慢互联"的直觉适用于算力受限的大模型，不适用于带宽受限的小模型。**
+
+**同一条命令还暴露了第二件事**：TP=2 的总吞吐虽然 +24.8%，
+但**每卡均摊吞吐从 620.92 掉到 387.40（−37.6%）**。
+所以要最大化 2×T4 的总吞吐，应该跑**两个独立单卡实例**（E7b）而不是 TP=2
+——但那会各自吃一份权重和 KV 配额。**E7b 未执行**，这个推算未经实测。
 
 **E7b 双实例（吞吐导向，可选）**
 
 两个进程分别绑 GPU 0 和 GPU 1，各跑一半请求，比较总吞吐。与 TP 不是一个实验，结果不能混排。
 
-### 5.3 Server 模式（Kaggle）
+### 5.3 Server 模式（Kaggle）—— 旧写法会失败，见坑 13
+
+**原手册的写法（2026-09-27 实测失败，保留作为反例）：**
 
 ```bash
+# ❌ 在 Kaggle 上不成立：后台进程随 cell 结束被回收
 !CUDA_VISIBLE_DEVICES=0 nohup python -m vllm.entrypoints.openai.api_server \
   --model Qwen/Qwen2.5-1.5B-Instruct --served-model-name qwen1.5b \
   --host 127.0.0.1 --port 8000 \
@@ -707,24 +943,51 @@ T4 之间走 PCIe、没有 NVLink，TP=2 的通信开销可能吃掉收益。**�
   --no-enable-prefix-caching > /kaggle/working/vllm-server-1.5b.log 2>&1 &
 ```
 
-等日志出现 `Application startup complete` 再压测：
+**实测后果**：64 个请求全部 `APIConnectionError: Connection error.`，
+`status=failed`、`output_tokens=0`。产物保留为失败实验：
+`results/raw/kaggle-1.5b-http-concurrency-16.jsonl`。
 
-```bash
-!sleep 90 && grep -c "Application startup complete" /kaggle/working/vllm-server-1.5b.log
+**原因**：Kaggle Notebook 不允许跨 cell 常驻的后台进程。
+`nohup ... &` 起的 server 在 cell 执行结束后被回收，压测时端口上没有任何进程。
 
-!python scripts/benchmark_http.py \
-  --model qwen1.5b \
-  --prompts experiments/concurrency/prompts_512x64.txt \
-  --requests 64 --concurrency 16 --max-tokens 64 \
-  --output results/raw/kaggle-1.5b-http-concurrency-16.jsonl
+**✅ 正确做法：把 server 的整个生命周期关在一个 cell 内**（本次未验证，见报告第 22.3 节）：
+
+```python
+import os, subprocess, time, urllib.request
+
+env = {**os.environ, "CUDA_VISIBLE_DEVICES": "0", "VLLM_USE_V1": "0"}
+proc = subprocess.Popen([
+    "python", "-m", "vllm.entrypoints.openai.api_server",
+    "--model", "Qwen/Qwen2.5-1.5B-Instruct", "--served-model-name", "qwen1.5b",
+    "--dtype", "half",                      # 坑 9
+    "--host", "127.0.0.1", "--port", "8000",
+    "--max-model-len", "1024", "--max-num-seqs", "16",
+    "--gpu-memory-utilization", "0.85",
+    "--no-enable-prefix-caching",           # V0 下本来就是关的，显式写更保险
+], env=env, stdout=open("/kaggle/working/vllm-server-1.5b.log", "wb"), stderr=subprocess.STDOUT)
+
+for _ in range(120):                        # 最多等 6 分钟
+    try:
+        urllib.request.urlopen("http://127.0.0.1:8000/v1/models", timeout=2)
+        print("server ready")
+        break
+    except Exception:
+        time.sleep(3)
+
+# 同一个 cell 内继续压测（不要换 cell！）
+os.system("python scripts/benchmark_http.py --model qwen1.5b "
+          "--prompts experiments/concurrency/prompts_512x64.txt "
+          "--requests 64 --concurrency 16 --max-tokens 64 "
+          "--output results/raw/kaggle-1.5b-http-concurrency-16.jsonl")
+
+proc.terminate()                            # 用完自己收掉
 ```
 
-Notebook 中断后进程可能还在，重启实验前先查端口和 PID：
+**关键点**：**不要跨 cell**。server 的启动、等待就绪、压测、关闭必须落在同一次 cell 执行里。
 
-```bash
-!nvidia-smi --query-compute-apps=pid,used_memory --format=csv
-!pkill -f vllm.entrypoints.openai.api_server
-```
+> 顺带把启动日志留下来（上面重定向到了 `/kaggle/working/vllm-server-1.5b.log`）：
+> 日志里的 `enable_prefix_caching`、attention backend、`Using V0/V1 engine` 三行
+> **恰好是产物里缺的那三个字段**（坑 8、10、11），补上能一次解决三个记录缺陷。
 
 ---
 
@@ -865,18 +1128,23 @@ $PY scripts/summarize_results.py results/raw/kaggle-1.5b-*.jsonl \
 
 ### 7.2 填报告
 
-`docs/benchmark_report.md` 的对应关系：
+`docs/benchmark_report.md` 现在是两部分，填的时候**不要跨部分混数字**：
 
-| 报告小节 | 数据来源 |
-| --- | --- |
-| 2. Environment | `results/raw/env-kaggle-*.json` + 每次 run 的 metadata 行 |
-| 3. Workload | prompt 文件的 `*.manifest.json` |
-| 5. HF vs vLLM | E1a（单请求对单请求）+ E1b（批量收益） |
-| 6. Concurrency | E2 + 7.1 的 GPU 表（显存上限/OOM 点）|
-| 7. Context Length | E3，注明**实际 input_tokens** 而不是 `max_model_len` |
-| 8. Prefix Caching | E4 的 shared vs random 两臂 |
-| 9. Chunked Prefill | E5，必须标注 V0 引擎 |
-| 10. Quantization | E6，把"不支持/资源不足/实验结果"三类分开写 |
+| Part I（本机 0.5B）| Part II（Kaggle 1.5B）| 数据来源 |
+| --- | --- | --- |
+| 2. Environment | 13. 环境与六个已知问题 | `env-kaggle-*.json`（**已不可信**，见坑 11）+ 每次 run 的 metadata 行 |
+| 3. Workload | 14. Workload | prompt 文件的 `*.manifest.json` + 产物里的 `input_tokens` |
+| 5. HF vs vLLM | 15. E1 | E1a（单请求对单请求）+ E1b（批量收益）|
+| 6. Concurrency | 16. E2 | E2 + GPU 表（显存上限/OOM 点）——**Kaggle 无 GPU 表** |
+| 7. Context Length | 17. E3 | E3，注明**实际 input_tokens** 而不是 `max_model_len` |
+| 8. Prefix Caching | **18. E4（异常，结论为空）** | E4 的 shared vs random 两臂 |
+| 9. Chunked Prefill | 19. E5 | E5，必须标注 V0 引擎 |
+| 10. Quantization | 20. E6 | E6，把"不支持/资源不足/实验结果"三类分开写 |
+| 11. Conclusions | 23. 跨硬件可比性 & 局限 | 全表 |
+| — | 21. E7 TP / 22. E8 server | 本机没有对应实验 |
+
+**Part I 与 Part II 之间只允许做定性比较**（报告 23.1）：
+两台机器的 GPU、模型、dtype、引擎**四个变量同时不同**，没有任何一对 run 是只差一个变量的。
 
 必须写进报告的限制：
 
@@ -889,17 +1157,26 @@ $PY scripts/summarize_results.py results/raw/kaggle-1.5b-*.jsonl \
 
 ## 8. 检查清单
 
-跑之前：
+跑之前（**通用**）：
 
 - [ ] `$PY scripts/make_prompts.py --check <文件>` 长度符合预期
 - [ ] prompt 文件条数 == `--requests`（坑 3）
 - [ ] `--max-model-len` ≥ prompt 实际长度 + `--max-tokens`（坑 4）
 - [ ] prefix caching 的臂确认了开关状态（坑 2）
 - [ ] chunked prefill 的臂用了 `VLLM_USE_V1=0`（坑 1）
-- [ ] V0 的臂满足 `max_num_batched_tokens ≥ max_model_len`（坑 6）
+- [ ] V0 的臂满足 `max_num_batched_tokens ≥ max_model_len`（坑 6，**仅显式传预算时**，见 1.2）
 - [ ] fp8 KV cache 的臂用了 `VLLM_USE_V1=0`（坑 7）
-- [ ] 每条命令的引擎版本（V0/V1）已记进报告——**JSONL 里没有这个字段**（坑 7）
-- [ ] Kaggle 上 `VLLM_USE_V1` / `HF_HOME` 在任何 import 之前设置
+- [ ] 每条命令的引擎版本（V0/V1）已记进报告——**2026-09-27 之后的新 run 由 `env_vars` 自动记录**
+
+跑之前（**Kaggle 专用**，坑 8–13）：
+
+- [ ] Cell 1 里 `VLLM_USE_V1="0"`、`HF_HOME` 在任何 import 之前设好（坑 8）
+- [ ] Cell 3 里 **卸载了 TensorFlow**（坑 12）
+- [ ] Cell 3 里 **transformers 降到了 4.51.1**（坑 11）
+- [ ] **每条** vLLM 命令都带 `--dtype half`（坑 9）
+- [ ] **每条** vLLM 命令都带 `VLLM_USE_V1=0`（坑 8）
+- [ ] 不在 Kaggle 上用 `nohup ... &` 起 server；要测 HTTP 就用 5.3 的 cell 内 subprocess 方案（坑 13）
+- [ ] Cell 4 拍的环境快照**拍在降级之后**，并人工核对 transformers 版本（坑 11）
 
 每次 run 之后：
 
@@ -913,9 +1190,9 @@ $PY scripts/summarize_results.py results/raw/kaggle-1.5b-*.jsonl \
 | --- | --- | --- |
 | 模型下载 | 已缓存 | 首次 5–10 分钟 |
 | server 首次启动 | ~2 分钟 | ~3 分钟 |
-| E1–E7 全部（0.5B）| 1–2 小时 | — |
-| E1–E7 全部（1.5B）| — | 2–3 小时 |
-| E6/E7（7B）| — | 2–4 小时（prefill 很慢）|
+| E1–E7 全部（0.5B）| 1–2 小时 ✅ | — |
+| E1–E7 全部（1.5B）| — | 2–3 小时 ✅（2026-09-27，一次 session 内跑完）|
+| E6/E7（7B）| — | ⬜ 2–4 小时（prefill 很慢）|
 | 汇总与写报告 | 1 小时 | 1 小时 |
 
 Kaggle 配额：单次 session 上限 12 小时，GPU 每周 30 小时。建议**一个模型一个 notebook**，避免重复下载权重；结果目录存成 Dataset 便于下次复用。
@@ -933,19 +1210,48 @@ Kaggle 配额：单次 session 上限 12 小时，GPU 每周 30 小时。建议*
 | `scripts/common.py` | 新增 `percentile()`，供新脚本复用 |
 | `scripts/benchmark.py` | 改用 `common.percentile`，删掉重复实现 |
 
+**2026-09-27（Kaggle 1.5B 轮）的改动：**
+
+| 文件 | 说明 |
+| --- | --- |
+| `scripts/common.py` | **`environment_metadata()` 新增 `env_vars` 字段**（`VLLM_USE_V1` / `VLLM_WORKER_MULTIPROC_METHOD` / `VLLM_ATTENTION_BACKEND` / `CUDA_VISIBLE_DEVICES` / `HF_HOME`，未设置时记为 `"<unset>"`）与 **`transformers` 版本**。这是待办 #1 的修补，**只对未来的 run 生效** |
+
 ---
 
-## 10. 本次实验（0.5B 本机全矩阵）暴露的待办
+## 10. 待办（2026-09-27 重排）
 
-按优先级排序，都是上面的坑直接推出来的：
+### 10.1 已完成
 
-1. **把 `VLLM_USE_V1` 写进 JSONL**（坑 7）。`environment_metadata()` 目前不记这个变量，
-   导致事后无法判断任一 run 跑在 V0 还是 V1 上——而坑 1、6、7 全都依赖它。
-   这是**最该先补的一条**，否则已经跑完的 AWQ 臂永远无法归因。
-2. **量化一节补一条同引擎、同 `gpu_memory_utilization` 的 FP16 基线**（坑 7）。
-   现在 AWQ / fp8 KV 只能和 `vllm-batch16`（V1、0.90）比，差 13% 却归因不了。
-3. **E5 的 ON 臂补 server 模式测量**。离线 batch 只能给出整体耗时，
-   看不出"短请求是否被长 prefill 拖慢"——而这正是 chunked prefill 的卖点。
-4. **7B / 1.5B 的 Kaggle 部分尚未开始**，本机只有 0.5B。报告第 2 节的环境表要留出 Kaggle 行。
-5. **`docs/kaggle_runbook.md` 是早期版本**，与 `runbook_three_models.md` 第 5、6 节重复且更旧；
-   建议合并或标注为历史文档，避免两处口径不一致。
+| 原待办 | 状态 |
+| --- | --- |
+| 把 `VLLM_USE_V1` 写进 JSONL（坑 7）| ✅ **已修补** `environment_metadata()`：新增 `env_vars` 字段（`VLLM_USE_V1` / `VLLM_WORKER_MULTIPROC_METHOD` / `VLLM_ATTENTION_BACKEND` / `CUDA_VISIBLE_DEVICES` / `HF_HOME`）与 `transformers` 版本。**只对未来 run 生效** |
+| 量化补一条对齐的 FP16 基线（坑 7）| ✅ **Kaggle 上做到了**：同引擎（V0）、同 `gpu_memory_utilization=0.85`、同 prompt，唯一变量是位宽 → **AWQ +13.3% 可归因** |
+| E2 向上扫 `max_num_seqs` 到 128/256 | ✅ **Kaggle 上扫完**：**天花板 = 并发请求数**，64 之后 −1.4% / −2.0% |
+| 开始 Kaggle 部分 | ✅ **1.5B 全矩阵完成**（E1–E7），三模型矩阵 2/3 |
+
+### 10.2 待办（按优先级）
+
+1. **查清 E4 的 prefix caching 异常**（报告 Part II 第 18 节）。
+   T4 上 `shared-on` 比 `shared-off` **慢 2.49 倍**，而本机同实验**快 21.9%**——方向相反。
+   相邻 run 的 pid 已排除机器漂移，但原因未定。
+   **这是目前唯一一条两台机器结论相反的实验，不查清则 E4 在 Kaggle 侧等于没有结论。**
+   方案：同 workload 跑 3 次 + 保存 vLLM 启动日志（确认 `enable_prefix_caching` 实际取值与所选 backend）。
+2. **在 Kaggle 上真正拿到 per-request 指标**（第 5.3 节的 cell 内 subprocess 方案）。
+   目前 Kaggle 侧**零 TTFT/TPOT/p95/p99**，导致：
+   E4/E5 的尾延迟问题在两台机器上都没答；也做不了第 4.7 节那种 server 与离线的交叉验证。
+   **缺口的优先级高于补 7B。**
+3. **给 Kaggle 补 GPU 遥测**。E2/E6 的显存问题全部无解，
+   "量化省了多少显存"至今**一个实测数字都没有**（报告 20.4 只给了按位宽推算的区间）。
+4. **7B（AWQ vs GPTQ）+ E7b（两个独立单卡实例）**。
+   E7b 能验证报告 21.2 的推算——TP=2 每卡效率掉 37.6%，两个独立实例是否真的更优。
+5. **给关键配置加重复实验（每个 ≥3 次）**。本轮测出了**噪声底 ±1.2%**
+   （报告 13.5，来自 `tp1` 与 `concurrency-64` 这对意外重复），但大多数臂仍只跑了一次，
+   ±1.2% 以内的差异（如 E2 的 64→128）目前无法解释。
+6. **把 attention backend 真正记进产物**。本次只加了 `VLLM_ATTENTION_BACKEND` 环境变量，
+   但**vLLM 自动选择的 backend 不会写进这个变量**——要从
+   `llm.llm_engine.vllm_config` 里读。这是报告 17.3"16384 代价"无法归因的直接原因。
+7. **重拍 `results/raw/env-kaggle-1.5b.json`**。它记的 `transformers: 5.0.0` 与实际用的
+   **4.51.1 矛盾**，**该快照不可信**（坑 11）。
+8. **本机 0.5B 的 OOM 边界仍未找到**（Part I 遗留）。Kaggle 证明的是"没有收益"，
+   不是"会 OOM"，两件事不要混。
+9. **`docs/kaggle_runbook.md` 已标注为历史文档**（与本节第 5 节重复且更旧），建议合并。
